@@ -1,0 +1,3 @@
+[submodule "toxic-messages-handling-project"]
+	path = toxic-messages-handling-project
+	url = https://github.com/AI-25-HSE-Team-18/toxic-messages-handling-project.git
