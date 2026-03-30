@@ -1,0 +1,7 @@
+{
+    "csv_name": "dump_features_include_numeric_1.csv",
+    "active_col": "text_save_inform",
+    "kafka_topic": "toxic-messages",
+    "kafka_bootstrap": "kafka:9092",
+    "batch_size": 5
+}
