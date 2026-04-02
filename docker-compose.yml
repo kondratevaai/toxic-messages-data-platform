@@ -7,8 +7,7 @@ services:
     ports:
       - "2181:2181"
     # networks:
-    #   - producer-s3-csv
-      # - prediction-network
+    #   - prediction-network
   kafka:
     image: wurstmeister/kafka
     ports:
@@ -16,6 +15,9 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+
+      # the address to listen for pyspark, for exampoe
+      # listeners config in Kafka: PROTOCOL_NAME://HOST_NAME:PORT
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
 
@@ -30,21 +32,7 @@ services:
     depends_on:
       - zookeeper
     # networks:
-    #   - producer-s3-csv
-      # - prediction-network
-  
-  # kafbat-ui:
-  #   container_name: kafbat-ui
-  #   image: ghcr.io/kafbat/kafka-ui:latest
-  #   ports:
-  #     - 8080:8080
-  #   environment:
-  #     DYNAMIC_CONFIG_ENABLED: 'true'
-  #     SWAGGER_UI_ENABLED: 'true'
-  #   volumes:
-  #     - ~/kui/config.yml:/etc/kafkaui/dynamic_config.yaml
-  #   depends_on:
-  #     - kafka
+    #   - prediction-network
     
   # run toxicity messages backend-api serivce: 
   backend-api:
@@ -55,7 +43,7 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      # demo is to print messages, so at least 1 producer should work: 
+      # demo's goal is to print messages, so at least 1 producer should work: 
       - messages-producer
     # networks:
     #   - prediction-network
@@ -77,21 +65,49 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+    
     # networks:
     #   - producer-s3-csv
 
+  # ui to review kafka insides: 
+  kafka-ui:
+    container_name: kafka-ui
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - 8080:8080
+    environment:
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    volumes:
+      - ./monitoring/kafka-ui-config.yml:/etc/kafkaui/dynamic_config.yaml
+  
+
   # run spark consumer to take messages from kafka topic and pass them
   # to the toxicity classifier model for inference:
-  # spark-consumer:
-  #   container_name: "spark-consumer"
-  #   build: 
-  #     context: messages_consumers/spark_consumer
-  #     dockerfile: Dockerfile
-  #   depends_on:
-  #     - kafka
-  #   networks: 
-  #     - prediction-network
+  spark-consumer:
+    container_name: "spark-consumer"
+    build: 
+      context: message_consumers/spark_consumer
+      dockerfile: Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPICS: toxic-messages
+      API_URL: http://backend-api:8000
+      BATCH_TIMEOUT_MS: 10000
+      CHECKPOINT_DIR: /tmp/spark_consumer_checkpoint
+      MAX_RETRIES: 3
+      REQUEST_TIMEOUT_S: 30
+    depends_on:
+      messages-producer:
+        condition: service_started
+    volumes:
+      - spark_consumer_checkpoint:/tmp/spark_consumer_checkpoint
+    # networks: 
+    #   - prediction-network
   
+
+volumes:
+  spark_consumer_checkpoint:
+    driver: local
 
 networks:
   prediction-network:

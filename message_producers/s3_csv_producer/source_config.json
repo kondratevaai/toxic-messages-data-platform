@@ -3,5 +3,7 @@
     "active_col": "text_save_inform",
     "kafka_topic": "toxic-messages",
     "kafka_bootstrap": "kafka:9092",
-    "batch_size": 5
+    "kafka_partition": 0,
+    "batch_size": 5,
+    "time_delay": 10
 }

@@ -39,6 +39,7 @@ def create_kafka_producer(retries=5, delay=5):
 
 def stream_csv_batches(reader, object_path, batch_size=BATCH_SIZE):
     """Stream CSV from S3 via GetObject and yield text batches without loading full DF."""
+    print(f'✓ Instantiating connection to S3 object: {object_path}')
     obj = reader.s3_client.get_object(Bucket=reader.bucket_name, Key=object_path)
     stream = io.TextIOWrapper(obj['Body'], encoding='utf-8')
     csv_reader = csv.DictReader(stream)
@@ -74,7 +75,8 @@ def main():
             total_sent += 1
 
         producer.flush()
-        print(f"Batch {batch_num}: sent {len(batch)} messages (total: {total_sent})")
+        # NOTE: now reviewing all the messages using kafka-ui 
+        # print(f"Batch {batch_num}: sent {len(batch)} messages (total: {total_sent})")
         time.sleep(PERIOD_S)  # small delay between batches
 
     producer.close()

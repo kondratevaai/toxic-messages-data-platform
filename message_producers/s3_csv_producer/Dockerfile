@@ -26,9 +26,6 @@ COPY source_config.json .
 # COPY ../../toxic-messages-handling-project/src/services/utils.py /app/shared/utils.py
 # COPY ../../toxic-messages-handling-project/src/services/__init__.py /app/shared/__init__.py
 
-# Expose a port (optional, not used yet)
-EXPOSE 9000
-
 # Set default environment variable
 ENV MODEL_CONFIG=/app/shared/config.json
 
