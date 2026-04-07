@@ -1,0 +1,174 @@
+services:
+  # create kafka topics to manage toxicity messages events
+  # using custom kafka image for automatic tpic creation: 
+
+  zookeeper:
+    image: wurstmeister/zookeeper
+    ports:
+      - "2181:2181"
+    # networks:
+    #   - prediction-network
+  kafka:
+    image: wurstmeister/kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+
+      # the address to listen for pyspark, for exampoe
+      # listeners config in Kafka: PROTOCOL_NAME://HOST_NAME:PORT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # messages : 2 partitions (s3:.csv, web-stream) : 1 replication factor 
+      KAFKA_CREATE_TOPICS: "toxic-messages:2:1"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --topic toxic-messages --describe"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      - zookeeper
+    # networks:
+    #   - prediction-network
+    
+  # run toxicity messages backend-api serivce: 
+  backend-api:
+    container_name: "toxicity-classifier-api"
+    build: 
+      context: ./toxic-messages-handling-project
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      # at least 1 producer must be included: 
+      - messages-producer
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 1m30s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    # networks:
+    #   - prediction-network
+
+  # run messages producer to take messages from s3 .csv and create a stream: 
+  messages-producer:
+    container_name: "messages-producer"
+    build: 
+      context: ./message_producers/s3_csv_producer
+      dockerfile: Dockerfile
+
+    # take json and some s3 logic from toxicity api to use s3 credentials: 
+    volumes:
+      - ./toxic-messages-handling-project/src/config.json:/app/config.json:ro
+      - ./toxic-messages-handling-project/src/services/utils.py:/app/utils.py:ro
+      - ./toxic-messages-handling-project/src/core/config.py:/app/core/config.py:ro
+      - ./message_producers/s3_csv_producer/source_config.json:/app/source_config.json:ro
+    environment:
+      - MODEL_CONFIG=/app/config.json
+    depends_on:
+      kafka:
+        condition: service_healthy
+    
+    # networks:
+    #   - producer-s3-csv
+
+  # reddit producer: fetches comments from Russian subreddits -> kafka partition 1
+  reddit-producer:
+    container_name: "reddit-producer"
+    build:
+      context: ./message_producers/net_stream_producers/reddit_ru_producer
+      dockerfile: Dockerfile
+    volumes:
+      - ./message_producers/net_stream_producers/reddit_ru_producer/source_config.json:/app/source_config.json:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ui to review kafka insides: 
+  kafka-ui:
+    container_name: kafka-ui
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - 8080:8080
+    environment:
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    volumes:
+      - ./monitoring/kafka-ui-config.yml:/etc/kafkaui/dynamic_config.yaml
+  
+
+  # run spark consumer to take messages from kafka topic and pass them
+  # to the toxicity classifier model for inference:
+  spark-consumer:
+    container_name: "spark-consumer"
+    build: 
+      context: message_consumers/spark_consumer
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      CONSUMER_CONFIG: /app/consumer_config.json
+    depends_on:
+      messages-producer:
+        condition: service_started
+      backend-api:
+        condition: service_healthy
+    volumes:
+      - spark_consumer_checkpoint:/tmp/spark_consumer_checkpoint
+      - ./message_consumers/spark_consumer/consumer_config.json:/app/consumer_config.json:ro
+    # networks: 
+    #   - prediction-network
+
+  # prometheus for scraping /metrics from backend-api:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      backend-api:
+        condition: service_healthy
+
+  # grafana for dashboards (pre-provisioned):
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: yesoreyeram-infinity-datasource
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana/data
+    depends_on:
+      - prometheus
+  
+
+volumes:
+  spark_consumer_checkpoint:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  prediction-network:
+    driver: bridge
+
+  # register producer networks to isolate them: 
+  producer-s3-csv:
+    driver: bridge
+  producer-web-stream:
+    driver: bridge
