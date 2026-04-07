@@ -1,0 +1,11 @@
+{
+    "kafka_bootstrap": "kafka:9092",
+    "kafka_topics": ["toxic-messages"],
+    "api_url": "http://backend-api:8000",
+    "api_token": null,
+    "batch_timeout_ms": 10000,
+    "checkpoint_dir": "/tmp/spark_consumer_checkpoint",
+    "max_retries": 3,
+    "request_timeout_s": 30,
+    "failOnDataLoss": false
+}

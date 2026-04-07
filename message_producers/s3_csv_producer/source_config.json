@@ -1,9 +1,11 @@
 {
     "csv_name": "dump_features_include_numeric_1.csv",
-    "active_col": "text_save_inform",
+    "active_col": "text_raw",
     "kafka_topic": "toxic-messages",
     "kafka_bootstrap": "kafka:9092",
     "kafka_partition": 0,
-    "batch_size": 5,
-    "time_delay": 10
+    "batch_size": 3,
+    "period_s": 10,
+    "kafka_retries": 5,
+    "kafka_retry_delay": 5
 }
