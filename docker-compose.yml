@@ -66,6 +66,7 @@ services:
       - ./toxic-messages-handling-project/src/config.json:/app/config.json:ro
       - ./toxic-messages-handling-project/src/services/utils.py:/app/utils.py:ro
       - ./toxic-messages-handling-project/src/core/config.py:/app/core/config.py:ro
+      - ./message_producers/s3_csv_producer/source_config.json:/app/source_config.json:ro
     environment:
       - MODEL_CONFIG=/app/config.json
     depends_on:
@@ -74,6 +75,18 @@ services:
     
     # networks:
     #   - producer-s3-csv
+
+  # reddit producer: fetches comments from Russian subreddits -> kafka partition 1
+  reddit-producer:
+    container_name: "reddit-producer"
+    build:
+      context: ./message_producers/net_stream_producers/reddit_ru_producer
+      dockerfile: Dockerfile
+    volumes:
+      - ./message_producers/net_stream_producers/reddit_ru_producer/source_config.json:/app/source_config.json:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
 
   # ui to review kafka insides: 
   kafka-ui:
@@ -94,6 +107,8 @@ services:
     build: 
       context: message_consumers/spark_consumer
       dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
     environment:
       CONSUMER_CONFIG: /app/consumer_config.json
     depends_on:
@@ -106,10 +121,46 @@ services:
       - ./message_consumers/spark_consumer/consumer_config.json:/app/consumer_config.json:ro
     # networks: 
     #   - prediction-network
+
+  # prometheus for scraping /metrics from backend-api:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      backend-api:
+        condition: service_healthy
+
+  # grafana for dashboards (pre-provisioned):
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: yesoreyeram-infinity-datasource
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana/data
+    depends_on:
+      - prometheus
   
 
 volumes:
   spark_consumer_checkpoint:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
     driver: local
 
 networks:

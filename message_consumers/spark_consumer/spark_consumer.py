@@ -10,6 +10,9 @@ import sys
 import json
 import logging
 import requests
+import threading
+from collections import deque
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from datetime import datetime
 from pyspark.sql import SparkSession, DataFrame
@@ -38,6 +41,51 @@ def load_config(config_path: str) -> dict:
 
 CONFIG_PATH = os.getenv('CONSUMER_CONFIG', '/app/consumer_config.json')
 CONFIG = load_config(CONFIG_PATH)
+
+# Partition ID -> human-readable source name mapping
+PARTITION_SOURCE_MAP = CONFIG.get('partition_source_map', {
+    "0": "s3-csv",
+    "1": "reddit"
+})
+
+# Thread-safe store for recent predictions (Grafana polls this)
+MAX_RECENT = 200
+recent_predictions = deque(maxlen=MAX_RECENT)
+predictions_lock = threading.Lock()
+
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    """Tiny HTTP handler that serves recent predictions as JSON."""
+
+    def do_GET(self):
+        if self.path.startswith("/recent"):
+            with predictions_lock:
+                data = list(recent_predictions)
+            payload = json.dumps(data, ensure_ascii=False, default=str).encode('utf-8')
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+        elif self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # suppress access logs
+
+
+def start_metrics_server(port: int = 8081):
+    """Start the metrics HTTP server in a daemon thread."""
+    server = HTTPServer(("0.0.0.0", port), MetricsHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Metrics HTTP server started on port {port}")
 
 
 
@@ -158,14 +206,15 @@ def process_batch(batch_df: DataFrame, batch_id: int, classifier: ToxicityClassi
     
     try:
         
-        # Collect texts from the batch (limit to avoid memory issues)
-        texts = batch_df.select("text").collect()
+        # Collect texts with partition info from the batch
+        rows = batch_df.select("text", "partition").collect()
         
         successful = 0
         failed = 0
         
-        for row in texts:
+        for row in rows:
             text = row["text"]
+            partition = row["partition"]
             
             if not text or len(text.strip()) == 0:
                 logger.warning(f"Batch {batch_id}: Skipping empty text")
@@ -177,9 +226,24 @@ def process_batch(batch_df: DataFrame, batch_id: int, classifier: ToxicityClassi
                 try:
                     result = classifier.classify(text)
                     
+                    source = PARTITION_SOURCE_MAP.get(str(partition), f"partition-{partition}")
+                    prediction_entry = {
+                        "text": text[:200],
+                        "partition": partition,
+                        "source": source,
+                        "prediction": result.get('prediction'),
+                        "prediction_label": "toxic" if result.get('prediction') == 1 else "non_toxic",
+                        "processing_time_ms": result.get('processing_time_ms'),
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "batch_id": batch_id
+                    }
+                    with predictions_lock:
+                        recent_predictions.appendleft(prediction_entry)
+
                     logger.info(
                         f"Text | {text[:100]} | "
                         f"Batch {batch_id}: Text classified | "
+                        f"Source: {source} (partition {partition}) | "
                         f"Prediction: {result.get('prediction')} | "
                         f"Time: {result.get('processing_time_ms', 'N/A')}ms"
                     )
@@ -318,6 +382,9 @@ def main():
     
     spark = None
     try:
+        # Start metrics HTTP server for Grafana
+        start_metrics_server(port=8081)
+
         # Ensure checkpoint directory exists
         os.makedirs(CONFIG['checkpoint_dir'], exist_ok=True)
         
