@@ -1,0 +1,11 @@
+{
+    "kafka_topic": "toxic-messages",
+    "kafka_bootstrap": "kafka:9092",
+    "kafka_partition": 1,
+    "subreddits": ["Pikabu", "ru"],
+    "fetch_interval_s": 10,
+    "batch_size": 10,
+    "kafka_retries": 5,
+    "kafka_retry_delay": 5,
+    "user_agent": "toxic-messages-reddit-producer/1.0"
+}
