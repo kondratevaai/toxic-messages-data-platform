@@ -112,12 +112,15 @@ services:
     environment:
       CONSUMER_CONFIG: /app/consumer_config.json
     depends_on:
+      kafka:
+        condition: service_healthy
       messages-producer:
         condition: service_started
       backend-api:
         condition: service_healthy
     volumes:
-      - spark_consumer_checkpoint:/tmp/spark_consumer_checkpoint
+      - spark_consumer_checkpoint_csv:/tmp/spark_consumer_checkpoint_csv
+      - spark_consumer_checkpoint_reddit:/tmp/spark_consumer_checkpoint_reddit
       - ./message_consumers/spark_consumer/consumer_config.json:/app/consumer_config.json:ro
     # networks: 
     #   - prediction-network
@@ -156,19 +159,21 @@ services:
   
 
 volumes:
-  spark_consumer_checkpoint:
+  spark_consumer_checkpoint_csv:
+    driver: local
+  spark_consumer_checkpoint_reddit:
     driver: local
   prometheus_data:
     driver: local
   grafana_data:
     driver: local
 
-networks:
-  prediction-network:
-    driver: bridge
+# networks:
+#   prediction-network:
+#     driver: bridge
 
-  # register producer networks to isolate them: 
-  producer-s3-csv:
-    driver: bridge
-  producer-web-stream:
-    driver: bridge
+#   # register producer networks to isolate them: 
+#   producer-s3-csv:
+#     driver: bridge
+#   producer-web-stream:
+#     driver: bridge

@@ -32,6 +32,5 @@ COPY spark_consumer.py /app/
 COPY consumer_config.json /app/
 
 ENV PYTHONUNBUFFERED=1
-ENV SPARK_LOCAL_IP=127.0.0.1
 
 CMD ["spark-submit", "/app/spark_consumer.py"]

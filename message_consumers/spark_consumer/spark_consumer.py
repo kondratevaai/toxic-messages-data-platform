@@ -2,29 +2,35 @@
 Spark Consumer for Toxicity Detection
 
 Reads messages from Kafka topics and sends them to the FastAPI toxicity classifier service.
-Processes messages in micro-batches using Spark Structured Streaming.
+Runs multiple streaming queries in parallel (one per Kafka partition) within a single
+Spark session.  Each query has its own ToxicityClassifierClient; rows within a micro-batch
+are classified concurrently via asyncio + ThreadPoolExecutor.
 """
 
 import os
 import sys
 import json
+import socket
 import logging
+import asyncio
 import requests
 import threading
+import time as time_module
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from datetime import datetime
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
-    col, from_json, get_json_object, window, count, current_timestamp
+    col, get_json_object, current_timestamp
 )
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.types import StringType
 
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - [%(processName)s] - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler("/tmp/spark_consumer.log")
@@ -41,12 +47,6 @@ def load_config(config_path: str) -> dict:
 
 CONFIG_PATH = os.getenv('CONSUMER_CONFIG', '/app/consumer_config.json')
 CONFIG = load_config(CONFIG_PATH)
-
-# Partition ID -> human-readable source name mapping
-PARTITION_SOURCE_MAP = CONFIG.get('partition_source_map', {
-    "0": "s3-csv",
-    "1": "reddit"
-})
 
 # Thread-safe store for recent predictions (Grafana polls this)
 MAX_RECENT = 200
@@ -86,12 +86,6 @@ def start_metrics_server(port: int = 8081):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     logger.info(f"Metrics HTTP server started on port {port}")
-
-
-
-KAFKA_MESSAGE_SCHEMA = StructType([
-    StructField("text", StringType(), True)
-])
 
 class ToxicityClassifierClient:
     """Client for communicating with FastAPI toxicity classifier."""
@@ -190,240 +184,290 @@ class ToxicityClassifierClient:
         self.session.close()
 
 
-def process_batch(batch_df: DataFrame, batch_id: int, classifier: ToxicityClassifierClient) -> None:
+async def _classify_row(
+    text: str,
+    partition: int,
+    batch_id: int,
+    classifier: ToxicityClassifierClient,
+    consumer_cfg: dict,
+    executor: ThreadPoolExecutor,
+) -> bool:
+    """
+    Classify a single row asynchronously (runs the synchronous classifier.classify
+    in a thread-pool so that multiple rows are processed concurrently).
+
+    Returns True on success, False on failure.
+    """
+    loop = asyncio.get_running_loop()
+    source = consumer_cfg['source']
+    max_retries = CONFIG['max_retries']
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = await loop.run_in_executor(executor, classifier.classify, text)
+
+            prediction_entry = {
+                "text": text[:200],
+                "partition": partition,
+                "source": source,
+                "prediction": result.get('prediction'),
+                "prediction_label": "toxic" if result.get('prediction') == 1 else "non_toxic",
+                "processing_time_ms": result.get('processing_time_ms'),
+                "timestamp": datetime.utcnow().isoformat(),
+                "batch_id": batch_id
+            }
+            with predictions_lock:
+                recent_predictions.appendleft(prediction_entry)
+
+            logger.info(
+                f"Text | {text[:100]} | "
+                f"Batch {batch_id}: Text classified | "
+                f"Source: {source} (partition {partition}) | "
+                f"Prediction: {result.get('prediction')} | "
+                f"Time: {result.get('processing_time_ms', 'N/A')}ms"
+            )
+            return True
+
+        except requests.RequestException as e:
+            logger.warning(
+                f"Batch {batch_id}: API call attempt {attempt}/{max_retries} failed: {e}"
+            )
+            if attempt == max_retries:
+                logger.error(
+                    f"Batch {batch_id}: Failed to classify after {max_retries} attempts: "
+                    f"{text[:100]}"
+                )
+                return False
+            await asyncio.sleep(2 ** (attempt - 1))
+
+        except Exception as e:
+            logger.error(
+                f"Batch {batch_id}: Unexpected error during classification: {e}"
+            )
+            return False
+
+    return False
+
+
+async def _process_batch_async(
+    rows: list,
+    batch_id: int,
+    classifier: ToxicityClassifierClient,
+    consumer_cfg: dict,
+) -> tuple[int, int]:
+    """
+    Process all rows of a micro-batch concurrently.
+    Returns (successful_count, failed_count).
+    """
+    executor = ThreadPoolExecutor(max_workers=min(len(rows), 16))
+    tasks = []
+
+    for row in rows:
+        text = row["text"]
+        partition = row["partition"]
+
+        if not text or len(text.strip()) == 0:
+            logger.warning(f"Batch {batch_id}: Skipping empty text")
+            continue
+
+        tasks.append(
+            _classify_row(
+                text, partition, batch_id,
+                classifier, consumer_cfg, executor,
+            )
+        )
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    executor.shutdown(wait=False)
+
+    successful = sum(1 for r in results if r is True)
+    failed = len(results) - successful
+    return successful, failed
+
+
+def process_batch(
+    batch_df: DataFrame,
+    batch_id: int,
+    classifier: ToxicityClassifierClient,
+    consumer_cfg: dict,
+) -> None:
     """
     Process a batch of messages from Kafka and send to classifier.
-    
+    All rows within the batch are classified concurrently via asyncio so that
+    a slow or stuck API call on one message does not block the others.
+
     Args:
         batch_df: DataFrame containing the batch of messages
         batch_id: Batch identifier
+        classifier: ToxicityClassifierClient instance
+        consumer_cfg: Per-consumer configuration dict (contains 'source', 'name', etc.)
     """
     if batch_df.count() == 0:
         logger.info(f"Batch {batch_id}: Empty batch, skipping")
         return
-    
+
     logger.info(f"Processing batch {batch_id} with {batch_df.count()} messages")
-    
+
     try:
-        
-        # Collect texts with partition info from the batch
         rows = batch_df.select("text", "partition").collect()
-        
-        successful = 0
-        failed = 0
-        
-        for row in rows:
-            text = row["text"]
-            partition = row["partition"]
-            
-            if not text or len(text.strip()) == 0:
-                logger.warning(f"Batch {batch_id}: Skipping empty text")
-                failed += 1
-                continue
-            
-            # Retry logic for failed requests
-            for attempt in range(1, CONFIG['max_retries'] + 1):
-                try:
-                    result = classifier.classify(text)
-                    
-                    source = PARTITION_SOURCE_MAP.get(str(partition), f"partition-{partition}")
-                    prediction_entry = {
-                        "text": text[:200],
-                        "partition": partition,
-                        "source": source,
-                        "prediction": result.get('prediction'),
-                        "prediction_label": "toxic" if result.get('prediction') == 1 else "non_toxic",
-                        "processing_time_ms": result.get('processing_time_ms'),
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "batch_id": batch_id
-                    }
-                    with predictions_lock:
-                        recent_predictions.appendleft(prediction_entry)
 
-                    logger.info(
-                        f"Text | {text[:100]} | "
-                        f"Batch {batch_id}: Text classified | "
-                        f"Source: {source} (partition {partition}) | "
-                        f"Prediction: {result.get('prediction')} | "
-                        f"Time: {result.get('processing_time_ms', 'N/A')}ms"
-                    )
-                    successful += 1
-                    break
-                    
-                except requests.RequestException as e:
-                    mr = CONFIG['max_retries']
-                    logger.warning(
-                        f"Batch {batch_id}: API call attempt {attempt}/{mr} failed: {e}"
-                    )
-                    
-                    if attempt == mr:
-                        logger.error(
-                            f"Batch {batch_id}: Failed to classify after {mr} attempts: "
-                            f"{text[:100]}"
-                        )
-                        failed += 1
-                    else:
-                        import time
-                        time.sleep(2 ** (attempt - 1))  # Exponential backoff
+        successful, failed = asyncio.run(
+            _process_batch_async(rows, batch_id, classifier, consumer_cfg)
+        )
 
-                except Exception as e:
-                    logger.error(
-                        f"Batch {batch_id}: Unexpected error during classification: {e}"
-                    )
-                    failed += 1
-                    break
-        
-        classifier.close()
-        
         logger.info(
             f"Batch {batch_id} completed: {successful} successful, {failed} failed"
         )
-        
+
     except Exception as e:
         logger.error(f"Batch {batch_id}: Unexpected error in processing: {e}", exc_info=True)
 
 
-def create_spark_session() -> SparkSession:
-    """
-    Create and configure Spark session for structured streaming.
-    
-    Returns:
-        Configured SparkSession
-    """
-    
-        # .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
-        # .config("spark.sql.session.timeZone", "UTC") \
-    # spark = SparkSession.builder \
-    #     .appName("ToxicitySparkConsumer") \
-    #     .config("spark.sql.streaming.checkpointLocation", CHECKPOINT_DIR) \
-    #     .config("spark.streaming.socketReceiveBuffer.size", "67108864") \
-    #     .config("spark.streaming.kafka.maxRatePerPartition", "10000") \
-    #     .getOrCreate()
-    spark = SparkSession \
-    .builder \
-    .appName("ToxicitySparkConsumer") \
-    .getOrCreate()
-    
-    spark.sparkContext.setLogLevel("WARN")
-    logger.info(f"Spark session created: {spark.version}")
-    
-    return spark
+def wait_for_kafka(host: str, port: int, timeout: int = 120) -> None:
+    """Block until the Kafka broker is reachable (DNS + TCP)."""
+    for attempt in range(1, timeout + 1):
+        try:
+            socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            sock = socket.create_connection((host, port), timeout=5)
+            sock.close()
+            logger.info(f"Kafka broker {host}:{port} is reachable")
+            return
+        except (socket.gaierror, OSError) as e:
+            if attempt % 10 == 0:
+                logger.warning(
+                    f"Waiting for Kafka at {host}:{port} "
+                    f"(attempt {attempt}/{timeout}): {e}"
+                )
+            time_module.sleep(1)
+    raise RuntimeError(f"Kafka broker {host}:{port} unreachable after {timeout}s")
 
 
-def create_kafka_stream(spark: SparkSession) -> DataFrame:
+def create_kafka_stream(
+    spark: SparkSession, consumer_cfg: dict
+) -> DataFrame:
     """
-    Create DataFrame from Kafka source.
-    
+    Create a streaming DataFrame that reads from a specific Kafka partition.
+
     Args:
-        spark: Active SparkSession
-        
+        spark: Active SparkSession.
+        consumer_cfg: Per-consumer config dict (topic, partition, bootstrap, etc.).
     Returns:
-        Streaming DataFrame from Kafka
+        Streaming DataFrame with parsed text and metadata columns.
     """
-    logger.info(f"Connecting to Kafka: {CONFIG['kafka_bootstrap']}")
-    logger.info(f"Subscribing to topics: {CONFIG['kafka_topics']}")
-    
-    # df = spark.readStream \
-    #     .format("kafka") \
-    #     .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP) \
-    #     .option("subscribe", ",".join(KAFKA_TOPICS)) \
-    #     .option("startingOffsets", "latest") \
-    #     .option("kafka.session.timeout.ms", "30000") \
-    #     .option("maxOffsetsPerTrigger", "1000") \
-    #     .load()
-    
+    topic = consumer_cfg['kafka_topic']
+    partition = consumer_cfg['kafka_partition']
+    assign_json = json.dumps({topic: [partition]})
+
+    logger.info(
+        f"Creating Kafka stream: "
+        f"bootstrap={consumer_cfg['kafka_bootstrap']} "
+        f"topic={topic} partition={partition}"
+    )
+
     df = spark.readStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", CONFIG['kafka_bootstrap']) \
-        .option("subscribe", ",".join(CONFIG['kafka_topics'])) \
+        .option("kafka.bootstrap.servers", consumer_cfg['kafka_bootstrap']) \
+        .option("assign", assign_json) \
         .option("includeHeaders", "true") \
-        .option("failOnDataLoss", CONFIG['failOnDataLoss']) \
+        .option("failOnDataLoss", consumer_cfg['failOnDataLoss']) \
         .load()
-    
-    # print('readstream created')
-    
-    # Parse JSON value and extract text field
+
     df = df.select(
         col("value").cast(StringType()).alias("raw_value"),
         col("timestamp").alias("kafka_timestamp"),
         col("topic"),
         col("partition"),
-        col("offset")
+        col("offset"),
     )
-    
-    # Parse JSON and extract text field
     df = df.select(
         get_json_object(col("raw_value"), "$.text").alias("text"),
         col("kafka_timestamp"),
         col("topic"),
         col("partition"),
         col("offset"),
-        current_timestamp().alias("processed_at")
+        current_timestamp().alias("processed_at"),
     )
-    
-    # Filter out null texts
     df = df.filter(col("text").isNotNull())
-    
-    logger.info("Kafka stream created and configured")
     return df
 
 
 def main():
-    """Main entry point for the Spark consumer."""
-    
+    """
+    Main entry point.
+    Creates a single Spark session and starts one streaming query per consumer
+    defined in the config.  Each query reads its own Kafka partition and has
+    its own ToxicityClassifierClient.  Queries run concurrently inside the
+    same JVM — no multiprocessing needed.
+    """
     logger.info("Starting Toxicity Spark Consumer")
-    logger.info(f"Configuration:")
-    logger.info(f"  Kafka Bootstrap: {CONFIG['kafka_bootstrap']}")
-    logger.info(f"  Kafka Topics: {CONFIG['kafka_topics']}")
     logger.info(f"  API URL: {CONFIG['api_url']}")
-    logger.info(f"  Batch Timeout: {CONFIG['batch_timeout_ms']}ms")
-    logger.info(f"  Checkpoint Dir: {CONFIG['checkpoint_dir']}")
     logger.info(f"  Max Retries: {CONFIG['max_retries']}")
-    
+    logger.info(f"  Consumers: {[c['name'] for c in CONFIG['consumers']]}")
+
+    # Metrics HTTP server (polled by Grafana)
+    start_metrics_server(port=CONFIG.get('metrics_port', 8081))
+
+    # Wait for Kafka to be DNS-resolvable and accepting TCP connections
+    bootstrap = CONFIG['consumers'][0]['kafka_bootstrap']
+    host, port_str = bootstrap.split(':')
+    wait_for_kafka(host, int(port_str))
+
     spark = None
+    classifiers: list[ToxicityClassifierClient] = []
     try:
-        # Start metrics HTTP server for Grafana
-        start_metrics_server(port=8081)
+        # Single Spark session for the entire process
+        spark = SparkSession.builder \
+            .appName("ToxicitySparkConsumer") \
+            .getOrCreate()
+        spark.sparkContext.setLogLevel("WARN")
+        logger.info(f"Spark session created: {spark.version}")
 
-        # Ensure checkpoint directory exists
-        os.makedirs(CONFIG['checkpoint_dir'], exist_ok=True)
-        
-        # Create Spark session
-        spark = create_spark_session()
-        
-        # Create Kafka stream
-        kafka_df = create_kafka_stream(spark)
+        # Start one streaming query per consumer config
+        queries = []
+        for consumer_cfg in CONFIG['consumers']:
+            name = consumer_cfg['name']
 
-        # init classifier client: 
-        classifier = ToxicityClassifierClient(
-            base_url=CONFIG['api_url'],
-            token=CONFIG.get('api_token'),
-            timeout=CONFIG['request_timeout_s']
-        )
-        classifier.authenticate()
-        
-        # Write stream with batch processing
-        query = kafka_df \
-            .writeStream \
-            .foreachBatch(
-                lambda batch_df, batch_id: 
-                process_batch(batch_df, batch_id, classifier)) \
-            .option("checkpointLocation", CONFIG['checkpoint_dir']) \
-            .trigger(processingTime=f"{CONFIG['batch_timeout_ms'] // 1000} seconds") \
-            .start()
-        
-        logger.info("Streaming query started successfully")
-        logger.info("Waiting for streaming data...")
-        
-        # Keep the application running
-        query.awaitTermination()
-        
+            # Each query gets its own API client
+            classifier = ToxicityClassifierClient(
+                base_url=CONFIG['api_url'],
+                token=CONFIG.get('api_token'),
+                timeout=CONFIG['request_timeout_s'],
+            )
+            classifier.authenticate()
+            classifiers.append(classifier)
+
+            # Kafka stream for this consumer's partition
+            kafka_df = create_kafka_stream(spark, consumer_cfg)
+
+            # Checkpoint directory
+            os.makedirs(consumer_cfg['checkpoint_dir'], exist_ok=True)
+
+            # Capture classifier & consumer_cfg in the lambda via default args
+            query = kafka_df.writeStream \
+                .foreachBatch(
+                    lambda batch_df, batch_id, _clf=classifier, _cfg=consumer_cfg:
+                        process_batch(batch_df, batch_id, _clf, _cfg)
+                ) \
+                .option("checkpointLocation", consumer_cfg['checkpoint_dir']) \
+                .trigger(processingTime=f"{consumer_cfg['batch_timeout_ms'] // 1000} seconds") \
+                .queryName(name) \
+                .start()
+
+            queries.append(query)
+            logger.info(f"Streaming query '{name}' started")
+
+        logger.info(f"All {len(queries)} streaming queries running, waiting for data...")
+
+        # awaitAnyTermination blocks until any query stops (or forever)
+        spark.streams.awaitAnyTermination()
+
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down...")
     except Exception as e:
         logger.error(f"Fatal error in consumer: {e}", exc_info=True)
-        raise
     finally:
+        for clf in classifiers:
+            clf.close()
         if spark is not None:
             spark.stop()
             logger.info("Spark session stopped")
