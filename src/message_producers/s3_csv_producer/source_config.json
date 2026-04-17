@@ -1,0 +1,7 @@
+{
+    "routing_key": "toxic-messages",
+    "csv_name": "dump_features_include_numeric_1.csv",
+    "active_col": "text_raw",
+    "batch_size": 3,
+    "period_s": 10
+}

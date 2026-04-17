@@ -1,0 +1,7 @@
+{
+    "routing_key": "toxic-messages",
+    "subreddits": ["Pikabu"],
+    "fetch_interval_s": 1,
+    "batch_size": 10,
+    "user_agent": "toxic-messages-reddit-producer/1.0"
+}
