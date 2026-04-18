@@ -42,9 +42,9 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    depends_on:
-      # at least 1 producer must be included: 
-      - messages-producer
+    # depends_on:
+    #   # at least 1 producer must be included: 
+    #   - messages-producer
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 1m30s
@@ -55,38 +55,65 @@ services:
     #   - prediction-network
 
   # run messages producer to take messages from s3 .csv and create a stream: 
-  messages-producer:
-    container_name: "messages-producer"
+  s3-csv-producer:
+    container_name: "s3-csv-producer"
     build: 
-      context: ./message_producers/s3_csv_producer
+      context: ./message_producers/
       dockerfile: Dockerfile
+
+    # registering all producers:
+    command: ["python", "-m", "s3_csv_producer.produce_messages"]
 
     # take json and some s3 logic from toxicity api to use s3 credentials: 
     volumes:
       - ./toxic-messages-handling-project/src/config.json:/app/config.json:ro
       - ./toxic-messages-handling-project/src/services/utils.py:/app/utils.py:ro
       - ./toxic-messages-handling-project/src/core/config.py:/app/core/config.py:ro
-      - ./message_producers/s3_csv_producer/source_config.json:/app/source_config.json:ro
+    # register source configs, use one common kafka config: 
     environment:
-      - MODEL_CONFIG=/app/config.json
+      - KAFKA_CONFIG=/app/kafka_config.json
+      - SOURCE_CONFIG=/app/s3_csv_producer/source_config.json
+    
     depends_on:
       kafka:
         condition: service_healthy
-    
-    # networks:
-    #   - producer-s3-csv
 
-  # reddit producer: fetches comments from Russian subreddits -> kafka partition 1
   reddit-producer:
     container_name: "reddit-producer"
     build:
       context: ./message_producers/net_stream_producers/reddit_ru_producer
       dockerfile: Dockerfile
+  
+    command: ["python", "-m", "net_stream_producers.reddit_ru_producer.produce_messages"]
     volumes:
       - ./message_producers/net_stream_producers/reddit_ru_producer/source_config.json:/app/source_config.json:ro
+      - ./message_producers/kafka_config.json:/app/kafka_config.json:ro
+    environment:
+      - KAFKA_CONFIG=/app/kafka_config.json
+      - SOURCE_CONFIG=/app/s3_csv_producer/source_config.json
     depends_on:
       kafka:
         condition: service_healthy
+    
+    networks:
+      - producer-web-stream
+    
+    # networks:
+    #   - producer-s3-csv
+
+  # # reddit producer: fetches comments from Russian subreddits -> kafka partition 1
+  # reddit-producer:
+  #   container_name: "reddit-producer"
+  #   build:
+  #     context: ./message_producers/net_stream_producers/reddit_ru_producer
+  #     dockerfile: Dockerfile
+  #   volumes:
+  #     - ./message_producers/net_stream_producers/reddit_ru_producer/source_config.json:/app/source_config.json:ro
+  #     - ./message_producers/kafka_config.json:/app/kafka_config.json:ro
+
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
 
   # ui to review kafka insides: 
   kafka-ui:
@@ -112,8 +139,8 @@ services:
     environment:
       CONSUMER_CONFIG: /app/consumer_config.json
     depends_on:
-      messages-producer:
-        condition: service_started
+      # messages-producer:
+      #   condition: service_started
       backend-api:
         condition: service_healthy
     volumes:

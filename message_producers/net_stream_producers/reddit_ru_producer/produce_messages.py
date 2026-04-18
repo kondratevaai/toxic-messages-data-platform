@@ -13,7 +13,10 @@ import logging
 import urllib.request
 import urllib.error
 
-from kafka import KafkaProducer
+# from kafka import KafkaProducer
+from message_producers.producer import ToxicityProducer
+from message_producers.msg_utils import load_source_config
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,36 +24,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
-
-
-def load_source_config(config_path: str) -> dict:
-    with open(config_path, 'r') as f:
-        return json.load(f)
-
-
-SOURCE_CONFIG_PATH = os.getenv('SOURCE_CONFIG', '/app/source_config.json')
-SOURCE_CONFIG = load_source_config(SOURCE_CONFIG_PATH)
-
-
-def create_kafka_producer(retries=None, delay=None):
-    if retries is None:
-        retries = SOURCE_CONFIG.get('kafka_retries', 5)
-    if delay is None:
-        delay = SOURCE_CONFIG.get('kafka_retry_delay', 5)
-    kafka_bootstrap = SOURCE_CONFIG['kafka_bootstrap']
-    for attempt in range(1, retries + 1):
-        try:
-            producer = KafkaProducer(
-                bootstrap_servers=kafka_bootstrap,
-                value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
-            )
-            logger.info(f"Connected to Kafka at {kafka_bootstrap}")
-            return producer
-        except Exception as e:
-            logger.warning(f"Kafka attempt {attempt}/{retries} failed: {e}")
-            if attempt < retries:
-                time.sleep(delay)
-    raise ConnectionError(f"Could not connect to Kafka after {retries} attempts")
 
 
 def fetch_subreddit_comments(subreddit: str, user_agent: str, limit: int = 25) -> list:
@@ -76,23 +49,25 @@ def fetch_subreddit_comments(subreddit: str, user_agent: str, limit: int = 25) -
 
 
 def main():
-    producer = create_kafka_producer()
+    # inst base class: 
+    # cfg_path = os.getenv('SOURCE_CONFIG', '/app/source_config.json')
+    reddit_producer = ToxicityProducer()
 
-    kafka_topic = SOURCE_CONFIG['kafka_topic']
-    kafka_partition = SOURCE_CONFIG['kafka_partition']
-    subreddits = SOURCE_CONFIG['subreddits']
-    fetch_interval = SOURCE_CONFIG['fetch_interval_s']
-    user_agent = SOURCE_CONFIG.get('user_agent', 'reddit-producer/1.0')
+    # additional param from the config: 
+    subreddits = reddit_producer.custpm_config.get('subreddits')
+    user_agent = reddit_producer.custpm_config.get('user_agent', 'reddit-producer/1.0')
 
     seen_texts = set()
     total_sent = 0
 
     logger.info(f"Starting Reddit producer: subreddits={subreddits}, "
-                f"partition={kafka_partition}, interval={fetch_interval}s")
+                f"partition={reddit_producer.kafka_partition}, interval={reddit_producer.custpm_config.get('fetch_interval', 5)}s")
 
     try:
         while True:
             for sub in subreddits:
+
+                # get one more msg: 
                 comments = fetch_subreddit_comments(sub, user_agent)
                 new_count = 0
                 for text in comments:
@@ -102,26 +77,27 @@ def main():
                         continue
                     seen_texts.add(text_hash)
 
-                    producer.send(kafka_topic, value={'text': text},
-                                  partition=kafka_partition)
+                    # send message to Kafka: 
+                    reddit_producer.produce_message(text)
+
                     new_count += 1
                     total_sent += 1
 
                 if new_count > 0:
-                    producer.flush()
+                    reddit_producer.producer.flush()
                     logger.info(f"r/{sub}: sent {new_count} new comments "
                                 f"(total: {total_sent})")
 
             # cap seen set to avoid unbounded growth
-            if len(seen_texts) > 50000:
-                seen_texts.clear()
+            # if len(seen_texts) > 50000:
+            #     seen_texts.clear()
 
-            time.sleep(fetch_interval)
+            time.sleep(reddit_producer.source_config.get('fetch_interval', 5))
 
     except (KeyboardInterrupt, Exception) as e:
         logger.info(f"Stopping reddit producer: {e}")
     finally:
-        producer.close()
+        reddit_producer.producer.close()
         logger.info(f"Done. Total messages sent: {total_sent}")
 
 

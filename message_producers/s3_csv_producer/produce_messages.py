@@ -1,57 +1,42 @@
+
+"""
+S3 CSV Producer
+===============
+Reads text data from an S3 CSV and pushes it to Kafka topic partition 0 in batches.
+"""
+
 import os
-import io
-import csv
 import sys
 import time
-import json
+import logging
+import io
+import csv
 
-try: 
-    from utils import Boto3Reader
-except ImportError as e:
-    # working inside liux composed docker seession, need to add /app to path: 
+from producer import ToxicityProducer
+from msg_utils import load_source_config
+
+try:
+    from s3_csv_producer.utils import Boto3Reader
+except ImportError:
     sys.path.insert(0, '/app')
+    from utils import Boto3Reader
 
-from kafka import KafkaProducer
-
-
-def load_source_config(config_path: str) -> dict:
-    """Load source configuration from JSON file."""
-    with open(config_path, 'r') as f:
-        return json.load(f)
-
-
-SOURCE_CONFIG_PATH = os.getenv('SOURCE_CONFIG', '/app/source_config.json')
-SOURCE_CONFIG = load_source_config(SOURCE_CONFIG_PATH)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 
-def create_kafka_producer(retries=None, delay=None):
-    """Create Kafka producer with retry logic for startup ordering."""
-    if retries is None:
-        retries = SOURCE_CONFIG.get('kafka_retries', 5)
-    if delay is None:
-        delay = SOURCE_CONFIG.get('kafka_retry_delay', 5)
-    kafka_bootstrap = SOURCE_CONFIG['kafka_bootstrap']
-    for attempt in range(1, retries + 1):
-        try:
-            producer = KafkaProducer(
-                bootstrap_servers=kafka_bootstrap,
-                value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
-            )
-            print(f"Connected to Kafka at {kafka_bootstrap}")
-            return producer
-        except Exception as e:
-            print(f"Kafka connection attempt {attempt}/{retries} failed: {e}")
-            if attempt < retries:
-                time.sleep(delay)
-    raise ConnectionError(f"Could not connect to Kafka after {retries} attempts")
+# additional to the kafka config which contains business-logic: 
+# SOURCE_CONFIG = load_source_config(os.getenv('SOURCE_CONFIG', 
+#                                              '/app/source_config.json'))
 
-
-def stream_csv_batches(reader, object_path, batch_size=None):
-    """Stream CSV from S3 via GetObject and yield text batches without loading full DF."""
-    if batch_size is None:
-        batch_size = SOURCE_CONFIG['batch_size']
-    active_col = SOURCE_CONFIG['active_col']
-    print(f'Instantiating connection to S3 object: {object_path}')
+def stream_csv_batches(reader, object_path, batch_size, active_col):
+    """Stream CSV from S3 via GetObject and yield text batches."""
+    
+    logger.info(f'Instantiating connection to S3 object: {object_path}')
     obj = reader.s3_client.get_object(Bucket=reader.bucket_name, Key=object_path)
     stream = io.TextIOWrapper(obj['Body'], encoding='utf-8')
     csv_reader = csv.DictReader(stream)
@@ -67,47 +52,40 @@ def stream_csv_batches(reader, object_path, batch_size=None):
     if batch:
         yield batch
 
-
 def main():
-    """Read CSV from S3 in small batches and push text lines to Kafka."""
+    cfg_path = 'config.json'
+    kfk_path = os.getenv('KAFKA_CONFIG')
+    src_path = os.getenv('SOURCE_CONFIG')
+    s3_producer = ToxicityProducer(kafka_cfg=kfk_path, source_cfg=src_path)
 
-    config_path = os.getenv('MODEL_CONFIG', '/app/config.json')
+    # business-logic cfg: 
+    csv_name = s3_producer.custpm_config.get('csv_name')
+    active_col = s3_producer.custpm_config.get('active_col')
 
-    # S3 reader
-    reader = Boto3Reader(config_path)
-    print(f"S3 reader initialized, bucket: {reader.bucket_name}")
+    # base kafka params: 
+    batch_size = s3_producer.batch_size
+    period_s = s3_producer.fetch_interval_s
 
-    # Kafka producer
-    producer = create_kafka_producer()
-
-    csv_name = SOURCE_CONFIG['csv_name']
-    kafka_topic = SOURCE_CONFIG['kafka_topic']
-    period_s = SOURCE_CONFIG['period_s']
+    reader = Boto3Reader(cfg_path)
+    logger.info(f"S3 reader initialized, bucket: {reader.bucket_name}")
 
     total_sent = 0
-    try: 
-        while True: 
-            # create new generator for each loop to re-read the CSV from S3, simulating new data arrival: 
-            gen_messages = stream_csv_batches(reader, csv_name)
+    try:
+        while True:
+            gen_messages = stream_csv_batches(reader, csv_name, batch_size, active_col)
             for batch_num, batch in enumerate(gen_messages, start=1):
                 for text in batch:
-                    # partition 0 is for csv producer, 
-                    # parition 1 is for online data producer
-                    producer.send(kafka_topic, value={'text': text}, 
-                                  partition=SOURCE_CONFIG['kafka_partition'])
+                    s3_producer.produce_message(text)
                     total_sent += 1
+                s3_producer.producer.flush()
+                logger.info(f"Batch {batch_num}: sent {len(batch)} messages (total: {total_sent})")
+                time.sleep(period_s)
 
-                producer.flush()
-                # NOTE: now reviewing all the messages using kafka-ui 
-                # print(f"Batch {batch_num}: sent {len(batch)} messages (total: {total_sent})")
-                time.sleep(period_s)  # small delay between batches
     except (KeyboardInterrupt, Exception) as e:
-        print(f"Stopping producer: {e}")
-    finally: 
-        producer.close()
+        logger.info(f"Stopping S3 CSV producer: {e}")
+    finally:
+        s3_producer.producer.close()
         del reader
-        print(f"Done. Total messages sent to '{kafka_topic}': {total_sent}")
+        logger.info(f"Done. Total messages sent: {total_sent}")
 
-
-# if __name__ == "__main__":
 main()
