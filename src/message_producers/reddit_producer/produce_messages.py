@@ -14,8 +14,11 @@ import urllib.request
 import urllib.error
 
 # from kafka import KafkaProducer
-from message_producers.producer import ToxicityProducer
-from message_producers.msg_utils import load_source_config
+# from message_producers.producer import ToxicityProducer
+# from message_producers.msg_utils import load_source_config
+
+from src.message_producers.producer import ToxicityProducer
+from src.utils import load_source_config
 
 
 logging.basicConfig(
@@ -50,12 +53,13 @@ def fetch_subreddit_comments(subreddit: str, user_agent: str, limit: int = 25) -
 
 def main():
     # inst base class: 
-    # cfg_path = os.getenv('SOURCE_CONFIG', '/app/source_config.json')
-    reddit_producer = ToxicityProducer()
+    kfk_path = os.getenv('KAFKA_CONFIG')
+    src_path = os.getenv('SOURCE_CONFIG')
+    reddit_producer = ToxicityProducer(kafka_cfg=kfk_path, source_cfg=src_path)
 
     # additional param from the config: 
-    subreddits = reddit_producer.custpm_config.get('subreddits')
-    user_agent = reddit_producer.custpm_config.get('user_agent', 'reddit-producer/1.0')
+    subreddits = reddit_producer.custom_config.get('subreddits')
+    user_agent = reddit_producer.custom_config.get('user_agent', 'reddit-producer/1.0')
 
     seen_texts = set()
     total_sent = 0

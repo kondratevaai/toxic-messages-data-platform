@@ -1,6 +1,0 @@
-{
-    "kafka_partition": 0,
-    
-    "csv_name": "dump_features_include_numeric_1.csv",
-    "active_col": "text_raw"
-}

@@ -21,8 +21,10 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
 
-      # messages : 2 partitions (s3:.csv, web-stream) : 1 replication factor 
-      KAFKA_CREATE_TOPICS: "toxic-messages:2:1"
+    volumes:
+    - ./kafka-init.sh:/kafka-init.sh
+    command: ["/bin/sh", "-c", "start-kafka.sh && /kafka-init.sh"]
+  
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --topic toxic-messages --describe"]
       interval: 10s
@@ -31,8 +33,6 @@ services:
       start_period: 30s
     depends_on:
       - zookeeper
-    # networks:
-    #   - prediction-network
     
   # run toxicity messages backend-api serivce: 
   backend-api:
@@ -42,78 +42,57 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    # depends_on:
-    #   # at least 1 producer must be included: 
-    #   - messages-producer
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 1m30s
       timeout: 30s
       retries: 5
       start_period: 30s
-    # networks:
-    #   - prediction-network
 
   # run messages producer to take messages from s3 .csv and create a stream: 
-  s3-csv-producer:
-    container_name: "s3-csv-producer"
-    build: 
-      context: ./message_producers/
-      dockerfile: Dockerfile
-
-    # registering all producers:
-    command: ["python", "-m", "s3_csv_producer.produce_messages"]
-
-    # take json and some s3 logic from toxicity api to use s3 credentials: 
-    volumes:
-      - ./toxic-messages-handling-project/src/config.json:/app/config.json:ro
-      - ./toxic-messages-handling-project/src/services/utils.py:/app/utils.py:ro
-      - ./toxic-messages-handling-project/src/core/config.py:/app/core/config.py:ro
-    # register source configs, use one common kafka config: 
-    environment:
-      - KAFKA_CONFIG=/app/kafka_config.json
-      - SOURCE_CONFIG=/app/s3_csv_producer/source_config.json
-    
-    depends_on:
-      kafka:
-        condition: service_healthy
-
-  reddit-producer:
-    container_name: "reddit-producer"
-    build:
-      context: ./message_producers/net_stream_producers/reddit_ru_producer
-      dockerfile: Dockerfile
-  
-    command: ["python", "-m", "net_stream_producers.reddit_ru_producer.produce_messages"]
-    volumes:
-      - ./message_producers/net_stream_producers/reddit_ru_producer/source_config.json:/app/source_config.json:ro
-      - ./message_producers/kafka_config.json:/app/kafka_config.json:ro
-    environment:
-      - KAFKA_CONFIG=/app/kafka_config.json
-      - SOURCE_CONFIG=/app/s3_csv_producer/source_config.json
-    depends_on:
-      kafka:
-        condition: service_healthy
-    
-    networks:
-      - producer-web-stream
-    
-    # networks:
-    #   - producer-s3-csv
-
-  # # reddit producer: fetches comments from Russian subreddits -> kafka partition 1
-  # reddit-producer:
-  #   container_name: "reddit-producer"
-  #   build:
-  #     context: ./message_producers/net_stream_producers/reddit_ru_producer
+  # s3-csv-producer:
+  #   container_name: "s3-csv-producer"
+  #   build: 
+  #     context: ./src/message_producers/
   #     dockerfile: Dockerfile
-  #   volumes:
-  #     - ./message_producers/net_stream_producers/reddit_ru_producer/source_config.json:/app/source_config.json:ro
-  #     - ./message_producers/kafka_config.json:/app/kafka_config.json:ro
 
+  #   # registering all producers:
+  #   command: ["python", "-m", "s3_csv_producer.produce_messages"]
+
+  #   # take json and some s3 logic from toxicity api to use s3 credentials: 
+  #   volumes:
+  #     - ./toxic-messages-handling-project/src/config.json:/app/config.json:ro
+  #     - ./toxic-messages-handling-project/src/services/utils.py:/app/utils.py:ro
+  #     - ./toxic-messages-handling-project/src/core/config.py:/app/core/config.py:ro
+  #   # register source configs, use one common kafka config: 
+  #   environment:
+  #     - KAFKA_CONFIG=/app/src/message_producers/kafka_config.json
+  #     - SOURCE_CONFIG=/app/src/message_producers/s3_csv_producer/source_config.json
+    
   #   depends_on:
   #     kafka:
   #       condition: service_healthy
+
+  # # register another producer using the same Dockerfile: 
+  # reddit-producer:
+  #   container_name: "reddit-producer"
+  #   build:
+  #     context: ./src/message_producers/net_stream_producers/reddit_ru_producer
+  #     dockerfile: Dockerfile
+  
+  #   command: ["python", "-m", "net_stream_producers.reddit_ru_producer.produce_messages"]
+  #   volumes:
+  #     - ./src/message_producers/net_stream_producers/reddit_ru_producer/source_config.json:/app/source_config.json:ro
+  #     - ./src/message_producers/kafka_config.json:/app/kafka_config.json:ro
+  #   environment:
+  #     - KAFKA_CONFIG=/app/src/message_producers/kafka_config.json
+  #     - SOURCE_CONFIG=/app/src/message_producers/s3_csv_producer/source_config.json
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+    
+  #   networks:
+  #     - producer-web-stream
 
   # ui to review kafka insides: 
   kafka-ui:
@@ -132,22 +111,18 @@ services:
   spark-consumer:
     container_name: "spark-consumer"
     build: 
-      context: message_consumers/spark_consumer
+      context: src/spark_consumer
       dockerfile: Dockerfile
     ports:
       - "8081:8081"
     environment:
       CONSUMER_CONFIG: /app/consumer_config.json
     depends_on:
-      # messages-producer:
-      #   condition: service_started
       backend-api:
         condition: service_healthy
     volumes:
       - spark_consumer_checkpoint:/tmp/spark_consumer_checkpoint
-      - ./message_consumers/spark_consumer/consumer_config.json:/app/consumer_config.json:ro
-    # networks: 
-    #   - prediction-network
+      - ./src/spark_consumer/consumer_config.json:/app/consumer_config.json:ro
 
   # prometheus for scraping /metrics from backend-api:
   prometheus:
@@ -190,12 +165,12 @@ volumes:
   grafana_data:
     driver: local
 
-networks:
-  prediction-network:
-    driver: bridge
+# networks:
+#   prediction-network:
+#     driver: bridge
 
-  # register producer networks to isolate them: 
-  producer-s3-csv:
-    driver: bridge
-  producer-web-stream:
-    driver: bridge
+#   # register producer networks to isolate them: 
+#   producer-s3-csv:
+#     driver: bridge
+#   producer-web-stream:
+#     driver: bridge
