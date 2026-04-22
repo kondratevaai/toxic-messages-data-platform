@@ -20,13 +20,12 @@ services:
       # listeners config in Kafka: PROTOCOL_NAME://HOST_NAME:PORT
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CREATE_TOPICS: >
+        s3-source:1:1:delete:3600000,
+        internet-sources:2:1:delete:604800000
 
-    volumes:
-    - ./kafka-init.sh:/kafka-init.sh
-    command: ["/bin/sh", "-c", "start-kafka.sh && /kafka-init.sh"]
-  
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --topic toxic-messages --describe"]
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server kafka:9092 --topic s3-source --describe"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -64,35 +63,34 @@ services:
   #     - ./toxic-messages-handling-project/src/config.json:/app/config.json:ro
   #     - ./toxic-messages-handling-project/src/services/utils.py:/app/utils.py:ro
   #     - ./toxic-messages-handling-project/src/core/config.py:/app/core/config.py:ro
+  #     - ./src/utils.py:/app/utils.py:ro
+  #     - ./src/logger.py:/app/logger.py:ro
   #   # register source configs, use one common kafka config: 
   #   environment:
-  #     - KAFKA_CONFIG=/app/src/message_producers/kafka_config.json
-  #     - SOURCE_CONFIG=/app/src/message_producers/s3_csv_producer/source_config.json
+  #     - KAFKA_CONFIG=/app/kafka_config.json
+  #     - SOURCE_CONFIG=/app/source_config.json
     
   #   depends_on:
   #     kafka:
   #       condition: service_healthy
 
-  # # register another producer using the same Dockerfile: 
+  # # # register another producer using the same Dockerfile: 
   # reddit-producer:
   #   container_name: "reddit-producer"
   #   build:
-  #     context: ./src/message_producers/net_stream_producers/reddit_ru_producer
+  #     context: ./src/message_producers
   #     dockerfile: Dockerfile
   
-  #   command: ["python", "-m", "net_stream_producers.reddit_ru_producer.produce_messages"]
+  #   command: ["python", "-m", "reddit_producer.produce_messages"]
   #   volumes:
-  #     - ./src/message_producers/net_stream_producers/reddit_ru_producer/source_config.json:/app/source_config.json:ro
-  #     - ./src/message_producers/kafka_config.json:/app/kafka_config.json:ro
+  #     - ./src/message_producers/reddit_producer/source_config.json:/app/source_config.json:ro
+  #     - ./src/message_producers/reddit_producer/kafka_config.json:/app/kafka_config.json:ro
   #   environment:
-  #     - KAFKA_CONFIG=/app/src/message_producers/kafka_config.json
-  #     - SOURCE_CONFIG=/app/src/message_producers/s3_csv_producer/source_config.json
+  #     - KAFKA_CONFIG=/app/kafka_config.json
+  #     - SOURCE_CONFIG=/app/source_config.json
   #   depends_on:
   #     kafka:
   #       condition: service_healthy
-    
-  #   networks:
-  #     - producer-web-stream
 
   # ui to review kafka insides: 
   kafka-ui:
@@ -100,10 +98,11 @@ services:
     image: provectuslabs/kafka-ui:latest
     ports:
       - 8080:8080
+    # more reliable and accessible wars instead of one more config: 
     environment:
-      DYNAMIC_CONFIG_ENABLED: 'true'
-    volumes:
-      - ./monitoring/kafka-ui-config.yml:/etc/kafkaui/dynamic_config.yaml
+      DYNAMIC_CONFIG_ENABLED: 'false'
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAP_SERVERS: kafka:9092
   
 
   # run spark consumer to take messages from kafka topic and pass them
@@ -116,13 +115,17 @@ services:
     ports:
       - "8081:8081"
     environment:
-      CONSUMER_CONFIG: /app/consumer_config.json
+      PROCESSOR_CONFIG: /app/processor_config.json
     depends_on:
       backend-api:
         condition: service_healthy
     volumes:
       - spark_consumer_checkpoint:/tmp/spark_consumer_checkpoint
-      - ./src/spark_consumer/consumer_config.json:/app/consumer_config.json:ro
+      - ./src/spark_consumer/processor_config.json:/app/processor_config.json:ro
+      - ./src/utils.py:/app/utils.py:ro
+      - ./src/logger.py:/app/logger.py:ro
+    # command:
+    # - ["python", "-m", "classify_consumed"]
 
   # prometheus for scraping /metrics from backend-api:
   prometheus:
@@ -144,6 +147,7 @@ services:
     ports:
       - "3000:3000"
     environment:
+      GF_LOG_LEVEL: warn
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_INSTALL_PLUGINS: yesoreyeram-infinity-datasource
@@ -164,13 +168,3 @@ volumes:
     driver: local
   grafana_data:
     driver: local
-
-# networks:
-#   prediction-network:
-#     driver: bridge
-
-#   # register producer networks to isolate them: 
-#   producer-s3-csv:
-#     driver: bridge
-#   producer-web-stream:
-#     driver: bridge

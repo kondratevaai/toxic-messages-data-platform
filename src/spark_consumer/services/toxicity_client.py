@@ -1,31 +1,16 @@
 
-
-# import os
-import sys
-# import json
 import logging
 import requests
-# import threading
-# from collections import deque
-# from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
-# from datetime import datetime
-# from pyspark.sql import SparkSession, DataFrame
-# from pyspark.sql.functions import (
-#     col, from_json, get_json_object, window, count, current_timestamp
-# )
-# from pyspark.sql.types import StructType, StructField, StringType
-# from message_producers.msg_utils import load_source_config
+
+# from src.logger import setup_logger
+from logger import setup_logger
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/tmp/spark_consumer.log")
-    ]
-)
+setup_logger()
+logger = logging.getLogger(__name__)
+
+
 
 class ToxicityClassifierClient:
     """Client for communicating with FastAPI toxicity classifier."""

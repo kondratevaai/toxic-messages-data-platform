@@ -11,6 +11,8 @@ import time
 import logging
 import io
 import csv
+# from src.logger import setup_logger
+from logger import setup_logger
 
 from src.message_producers.producer import ToxicityProducer
 from src.utils import load_source_config
@@ -21,11 +23,9 @@ except ImportError:
     sys.path.insert(0, '/app')
     from src.message_producers.s3_csv_producer.utils import Boto3Reader
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+# from src.logger import setup_logger
+
+setup_logger()
 logger = logging.getLogger(__name__)
 
 

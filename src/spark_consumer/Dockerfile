@@ -8,9 +8,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Create working directory
 WORKDIR /app
+COPY . .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir \
+# RUN pip install --no-cache-dir \
+RUN pip install \
     pyspark==3.5.0 \
     requests==2.31.0 \
     kafka-python==2.0.2 \
@@ -34,4 +36,4 @@ RUN curl -fSL -o ${SPARK_JARS_DIR}/spark-sql-kafka-0-10_2.12-3.5.0.jar \
 ENV PYTHONUNBUFFERED=1
 ENV SPARK_LOCAL_IP=127.0.0.1
 
-CMD ["spark-submit", "/app/spark_consumer.py"]
+CMD ["spark-submit", "/app/classify_consumed.py"]

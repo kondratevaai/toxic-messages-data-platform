@@ -8,19 +8,12 @@ from time import time
 # from ..producer import ToxicityProducer, load_source_config
 from src.utils import load_source_config
 from kafka import KafkaProducer
-# from message_producers.s3_csv_producer.produce_messages import SOURCE_CONFIG
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+from src.logger import setup_logger
+setup_logger()
 logger = logging.getLogger(__name__)
 
-
-# SOURCE_CONFIG_PATH = os.getenv('SOURCE_CONFIG', '/app/source_config.json')
-# KAFKA_CONFIG_PATH = os.getenv('KAFKA_CONFIG', '/app/kafka_config.json')
 
 class ToxicityProducer:
     def __init__(self, kafka_cfg: str, source_cfg: str):

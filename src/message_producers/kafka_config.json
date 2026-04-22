@@ -1,5 +1,4 @@
 {
-    "kafka_topic_default": "toxic-messages",
     "kafka_bootstrap": "kafka:9092",
     "fetch_interval_s": 10,
     "batch_size": 10,
